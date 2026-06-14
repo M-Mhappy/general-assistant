@@ -25,10 +25,18 @@ const LLM_TIMEOUT = 120000;    // 单次 API 调用超时 2 分钟
 // ============================================================
 
 function getConfig() {
+  const required = ['LLM_BASE_URL', 'LLM_API_KEY', 'LLM_MODEL'];
+  const missing = required.filter((k) => !process.env[k]);
+  if (missing.length > 0) {
+    throw new Error(
+      `缺少必要的环境变量: ${missing.join(', ')}。请在项目根目录创建 .env 文件（参考 .env.example）。`
+    );
+  }
+
   return {
-    baseURL: process.env.LLM_BASE_URL || 'https://api.deepseek.com/v1',
-    apiKey: process.env.LLM_API_KEY || 'sk-f677900846a247d786fc78f1932211de',
-    model: process.env.LLM_MODEL || 'deepseek-v4-pro',
+    baseURL: process.env.LLM_BASE_URL,
+    apiKey: process.env.LLM_API_KEY,
+    model: process.env.LLM_MODEL,
   };
 }
 

@@ -7,6 +7,9 @@
  *   modules/*          — 业务逻辑模块
  */
 
+// 必须在所有其他 require 之前加载 .env
+require('dotenv').config();
+
 const { app, BrowserWindow, ipcMain, shell, dialog } = require('electron');
 const path = require('path');
 const topicManager = require('./modules/topic-manager');

@@ -22,7 +22,10 @@ const SEARCH_TIMEOUT = 20000;
  * 优先级：环境变量 > 硬编码（MVP 阶段）
  */
 function getApiKey() {
-  return process.env.TAVILY_API_KEY || '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';
+  if (!process.env.TAVILY_API_KEY) {
+    throw new Error('未配置 TAVILY_API_KEY 环境变量，请在 .env 文件中设置');
+  }
+  return process.env.TAVILY_API_KEY;
 }
 
 /**
