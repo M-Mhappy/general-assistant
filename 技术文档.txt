@@ -1,0 +1,388 @@
+# 技术文档
+
+本文档是“个人通用助手”项目的全局技术记录，用于持续沉淀开发过程中的架构决策、模块实现方式、协议格式、遇到的问题、解决方案和后续 TODO。
+
+开发过程中必须遵守 `项目开发通用skill.md` 中的原则：先思考后编码、模块化设计、简洁优先、精准改动、目标驱动执行。
+
+---
+
+## 1. MVP 目标
+
+构建一款桌面端极轻量版 Codex，用于处理不复杂的日常事务，包括：
+
+- 查网页、读取网页内容、抓取公开数据。
+- 整理数据并输出指定格式文件。
+- 编写并执行 Python 代码完成特定任务。
+- 生成简单 HTML 页面、Markdown 文档、CSV/JSON/TXT 等文件。
+- 在受控 workspace 中读取和保存用户上传、工具下载、代码生成的文件。
+
+MVP 强调“可用闭环”，不追求一开始就覆盖复杂自动化或强沙箱。
+
+---
+
+## 2. 已冻结需求
+
+### 2.1 桌面端形态
+
+- 目标形态：桌面端应用。
+- 推荐技术路线：Electron + 前端聊天界面 + Node.js 主进程 + Python 长驻子进程。
+- 不采用 FastAPI 作为 MVP 主架构，除非后续需要拆成独立服务端。
+
+### 2.2 LLM 接入
+
+- 使用兼容 OpenAI API 格式的第三方 API。
+- 配置项至少包括：
+  - `baseURL`
+  - `apiKey`
+  - `model`
+- Agent 编排层按 OpenAI-compatible tool calling 设计。
+
+### 2.3 MVP 前端显示范围
+
+MVP 只需要显示：
+
+- 助手回答文本。
+- 工具调用摘要。
+- Python stdout/stderr 输出。
+- 当前 Topic 生成文件列表。
+
+MVP 不做复杂 timeline、调试面板或可视化执行图。
+
+### 2.4 文件访问边界
+
+- MVP 只允许访问当前 Topic workspace。
+- 不允许任意读取本机路径。
+- 后续可以增加“用户手动选择文件/目录授权”。
+
+### 2.5 输出格式
+
+MVP 支持：
+
+- Markdown
+- HTML
+- CSV
+- JSON
+- TXT
+
+MVP 暂不支持复杂 `.docx`、`.xlsx`、PDF 生成。
+
+### 2.6 Topic / 会话空间
+
+- 每个 Topic 有独立文件目录。
+- Python 代码、浏览器下载、HTTP 下载、用户上传、生成文件都在该 Topic workspace 中。
+- MVP 可以先实现单窗口使用，但核心数据结构和工具调用必须携带 `topicId`。
+- 后续支持多个会话窗口并行执行时，每个 Topic 应拥有独立状态与资源边界。
+
+---
+
+## 3. MVP 不做的范围
+
+- 长期记忆或跨 Topic 记忆检索。
+- 多窗口并行执行的完整 UI。
+- 多用户、云端部署、权限系统。
+- Docker 或强沙箱隔离。
+- 自动处理登录、验证码、支付、敏感操作。
+- 复杂网页视觉定位。
+- `.docx`、`.xlsx`、PDF 等复杂文档生成。
+
+---
+
+## 4. 总体架构
+
+```text
+用户
+  |
+  v
+Electron 前端 UI
+  |
+  v
+Electron / Node.js 主进程
+  |
+  +-- Agent 编排层
+  |     |
+  |     +-- OpenAI-compatible LLM API
+  |
+  +-- 工具路由层
+        |
+        +-- 文件系统工具
+        +-- HTTP/API 抓取工具
+        +-- Playwright 浏览器工具
+        +-- Python 执行工具
+              |
+              v
+          Python 长驻子进程
+
+Topic workspace
+  |
+  +-- input/
+  +-- output/
+  +-- temp/
+  +-- downloads/
+  +-- code/
+```
+
+### 核心原则
+
+- LLM 只做决策，不直接操作文件、浏览器或代码运行环境。
+- 工具负责实际执行，并返回结构化结果。
+- 所有工具调用必须携带 `topicId`，并限制在该 Topic workspace 内。
+- 优先使用 HTTP/API 抓取工具；只有 HTTP/API 不适合时才使用浏览器。
+- 操作前分析，操作后验证。
+
+---
+
+## 5. Topic Workspace 设计
+
+推荐目录结构：
+
+```text
+workspace/
+  topics/
+    topic_<id>/
+      input/
+      output/
+      temp/
+      downloads/
+      code/
+      topic.json
+```
+
+### 目录职责
+
+- `input/`：用户上传或手动导入的文件。
+- `output/`：最终生成物。
+- `temp/`：中间文件、缓存、临时结果。
+- `downloads/`：HTTP/API 或浏览器下载文件。
+- `code/`：Agent 生成并需要保存的代码文件。
+- `topic.json`：Topic 元信息，例如标题、创建时间、最近更新时间、状态。
+
+### 并行预留
+
+MVP 可以只启动一个 Topic 运行，但实现时应避免全局单例污染：
+
+- 文件路径解析必须基于 `topicId`。
+- Python 执行器管理应预留按 Topic 分配实例的能力。
+- 浏览器 page/session 应预留按 Topic 绑定的能力。
+- 工具结果记录应归属于当前 Topic。
+
+---
+
+## 6. 核心模块
+
+### 6.1 Agent 编排层
+
+职责：
+
+- 接收用户消息。
+- 构建 messages 和 tools。
+- 调用兼容 OpenAI 格式的 LLM API。
+- 解析 tool call。
+- 调用工具路由层。
+- 将工具结果回填给 LLM。
+- 输出最终回答。
+
+MVP 行为：
+
+- 支持多轮 tool call。
+- 支持工具调用摘要展示。
+- 遇到登录、验证码、支付、敏感操作时停止并询问用户。
+- 工具失败时给 LLM 可读错误，由 LLM 决定重试、换工具或告知用户。
+
+### 6.2 文件系统工具
+
+工具：
+
+- `list_files`
+- `read_file`
+- `write_file`
+- `delete_file`
+- `file_exists`
+
+安全约束：
+
+- 所有路径必须 normalize 后校验。
+- 目标路径必须位于当前 Topic workspace 内。
+- 禁止 `../` 越权访问。
+- 删除操作 MVP 只允许删除当前 Topic 内文件。
+
+### 6.3 HTTP/API 抓取工具
+
+HTTP/API 是数据获取首选路径。
+
+工具：
+
+- `http_get`
+- `http_post`
+- `download_file`
+- `parse_html_text`
+- `save_response`
+
+能力：
+
+- 自定义 headers。
+- query 参数。
+- JSON body。
+- 返回状态码、响应头、文本摘要。
+- 自动识别并解析 JSON。
+- HTML 转可读文本。
+- 下载文件保存到 `downloads/`。
+
+设计原则：
+
+- 能通过 HTTP/API 完成时，不启动浏览器。
+- 对大响应做截断或保存文件后返回摘要。
+- 不绕过登录、验证码、付费墙或网站访问限制。
+
+### 6.4 Playwright 浏览器工具
+
+浏览器作为后备路径。
+
+MVP 工具：
+
+- `browser_navigate`
+- `browser_read_page`
+- `browser_click`
+- `browser_input`
+- `browser_scroll`
+- `browser_screenshot`
+- `browser_download_file`
+
+MVP 限制：
+
+- 不做自动登录。
+- 不处理验证码。
+- 不执行支付、下单、删除账号等敏感操作。
+- 不做复杂视觉定位。
+
+### 6.5 Python 执行器
+
+职责：
+
+- 执行 Agent 生成的 Python 代码。
+- 支持数据分析、文件处理、图表生成、简单网页/HTML 生成。
+- 输出 stdout/stderr 流。
+- 返回表达式结果和异常 traceback。
+
+通信方式：
+
+- Node.js 主进程 spawn Python 子进程。
+- stdin/stdout 使用 JSON-line 协议。
+
+核心消息：
+
+- Node -> Python: `execute`
+- Node -> Python: `install`
+- Node -> Python: `cancel`
+- Node -> Python: `shutdown`
+- Python -> Node: `ready`
+- Python -> Node: `stream_output`
+- Python -> Node: `executeResult`
+- Python -> Node: `error`
+- Python -> Node: `shutdownAck`
+
+取消机制：
+
+- 先发送 `cancel` 请求。
+- 若超时仍未停止，由 Node.js kill Python 子进程。
+- kill 后自动重启 Python 执行器。
+- 被 kill 后内存变量状态丢失，这是 MVP 可接受行为。
+
+安全边界：
+
+- Python 默认工作目录设置为当前 Topic workspace。
+- MVP 不做强沙箱。
+- 后续如需更强安全，再评估 Docker 或系统级沙箱。
+
+---
+
+## 7. 推荐第一阶段开发顺序
+
+### Phase 1: 项目骨架和 Topic workspace
+
+目标：
+
+- 搭建 Electron 项目基础结构。
+- 实现 Topic workspace 创建和路径解析。
+- 实现基础文件系统工具。
+
+验证：
+
+- 能创建默认 Topic。
+- 能在 Topic workspace 内写入、读取、列出文件。
+- 越权路径访问会被拒绝。
+
+### Phase 2: Python 执行器
+
+目标：
+
+- 实现 Python 长驻子进程。
+- 实现 JSON-line 协议。
+- 实现 `execute`、`stream_output`、`executeResult`、`shutdown`。
+
+验证：
+
+- 执行 `print("hello")` 能实时显示输出。
+- 执行最后一行表达式能返回结果。
+- Python 能在 Topic workspace 内生成 HTML/CSV/JSON/TXT 文件。
+
+### Phase 3: HTTP/API 工具
+
+目标：
+
+- 实现 GET、POST、下载、HTML 文本提取。
+
+验证：
+
+- 能抓取公开网页文本并保存 Markdown。
+- 能请求 JSON API 并保存 JSON。
+- 下载文件只能保存到当前 Topic workspace。
+
+### Phase 4: LLM Agent Loop
+
+目标：
+
+- 接入 OpenAI-compatible API。
+- 实现 tools 定义、tool call 解析、工具路由和多轮循环。
+
+验证：
+
+- 用户要求生成 HTML 页面时，Agent 能调用文件或 Python 工具完成。
+- 用户要求抓网页整理时，Agent 优先调用 HTTP/API 工具。
+
+### Phase 5: Playwright 浏览器工具
+
+目标：
+
+- 实现基础浏览器后备工具。
+
+验证：
+
+- 能打开网页、读取文本、点击、输入、滚动、截图。
+- 遇到登录/验证码类场景能停止并提示用户。
+
+### Phase 6: 前端体验整理
+
+目标：
+
+- 显示回答文本、工具调用摘要、Python 输出、生成文件。
+
+验证：
+
+- 用户能清楚看到任务执行过程。
+- 生成文件可在 Topic 文件列表中看到。
+
+---
+
+## 8. MVP 验收标准
+
+MVP 完成时至少跑通以下任务：
+
+1. 用户说“生成一个简单 HTML 页面并保存”，Agent 能生成文件，并在文件列表显示。
+2. 用户说“抓取某网页内容并整理成 Markdown”，Agent 优先用 HTTP/API 工具完成。
+3. 用户说“读取这个 CSV，统计并输出 JSON”，Agent 能用 Python 完成并保存结果。
+4. 用户取消 Python 长任务时，系统能停止任务并恢复可用。
+5. 每个 Topic 的文件互相隔离，不越权访问。
+
+---
+
+

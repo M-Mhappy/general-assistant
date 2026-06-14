@@ -1,0 +1,16 @@
+{
+  "name": "personal-assistant",
+  "version": "0.1.0",
+  "description": "桌面端极轻量版 Codex — 个人通用助手",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "dev": "electron . --dev"
+  },
+  "dependencies": {
+    "playwright": "^1.60.0"
+  },
+  "devDependencies": {
+    "electron": "^33.0.0"
+  }
+}

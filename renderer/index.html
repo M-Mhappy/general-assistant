@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'" />
+  <title>个人通用助手</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div id="app">
+    <!-- 侧边栏 -->
+    <aside id="sidebar">
+      <div class="sidebar-header">
+        <h2>Topic</h2>
+        <button id="btn-new-topic" title="新建 Topic">＋</button>
+      </div>
+      <ul id="topic-list"></ul>
+      <div class="sidebar-footer">
+        <small id="current-topic-label">—</small>
+      </div>
+    </aside>
+
+    <!-- 主区域 -->
+    <main id="main">
+      <!-- 消息区 -->
+      <section id="messages"></section>
+
+      <!-- 输入区 -->
+      <section id="input-area">
+        <textarea id="user-input" rows="2" placeholder="输入你的请求..."></textarea>
+        <button id="btn-upload" title="上传文件（Word/PDF/Excel/文本等）">📎</button>
+        <button id="btn-send">发送</button>
+      </section>
+    </main>
+
+    <!-- 右侧面板 — 文件列表 -->
+    <aside id="right-panel">
+      <div class="panel-header">
+        <h3>文件</h3>
+        <button id="btn-refresh-files" title="刷新">↻</button>
+      </div>
+      <ul id="file-list"></ul>
+      <div id="status-bar">
+        <span id="status-agent">⚪ Agent 未连接</span>
+      </div>
+    </aside>
+  </div>
+
+  <script src="renderer.js"></script>
+</body>
+</html>
