@@ -16,6 +16,7 @@
 const https = require('https');
 const http = require('http');
 const { URL } = require('url');
+const path = require('path');
 
 const MAX_LLM_ITERATIONS = 30; // 防止无限 tool call 循环（搜索密集型任务需要更多轮次）
 const LLM_TIMEOUT = 120000;    // 单次 API 调用超时 2 分钟
@@ -481,6 +482,333 @@ async function executeToolCall(toolName, toolArgs, context) {
 }
 
 // ============================================================
+// 任务执行可观察性
+// ============================================================
+
+function getLatestUserGoal(messages) {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i]?.role === 'user') return String(messages[i].content || '').trim();
+  }
+  return '处理用户请求';
+}
+
+function createTaskId() {
+  return `task-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+}
+
+function shouldUsePlannedMode(goal) {
+  const text = goal || '';
+  if (text.length >= 80) return true;
+  return /(整理|分析|统计|调研|研究|比较|总结|抓取|爬取|生成.*报告|读取.*文件|读取.*表格|批量|多个|保存|输出|转换|清洗|可视化|网页|CSV|Excel|PDF|Word|Markdown|HTML|JSON)/i.test(text);
+}
+
+function buildTaskPlan(goal, mode) {
+  if (mode === 'direct') {
+    return [
+      { id: 'step_direct', title: '直接处理请求', status: 'pending', kind: 'work' },
+      { id: 'step_verify', title: '检查结果', status: 'pending', kind: 'verify' },
+    ];
+  }
+
+  return [
+    { id: 'step_understand', title: '理解目标并选择路径', status: 'pending', kind: 'understand' },
+    { id: 'step_gather', title: '获取或读取必要信息', status: 'pending', kind: 'gather' },
+    { id: 'step_process', title: '处理信息并生成结果', status: 'pending', kind: 'process' },
+    { id: 'step_verify', title: '验证产物与回答', status: 'pending', kind: 'verify' },
+  ];
+}
+
+function publicPlan(plan) {
+  return plan.map(({ id, title, status }) => ({ id, title, status }));
+}
+
+function safeJsonParse(text) {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return null;
+  }
+}
+
+function summarizeToolArgs(toolName, args) {
+  if (!args || typeof args !== 'object') return '';
+  if (args.query) return args.query;
+  if (args.url) return args.url;
+  if (args.filePath) return args.filePath;
+  if (args.subPath) return args.subPath;
+  if (args.code) return args.code.split('\n')[0].slice(0, 80);
+  if (args.format) return args.format;
+  return toolName;
+}
+
+function summarizeToolResult(toolName, result, error) {
+  if (error) return `${toolName} 执行失败: ${error}`;
+
+  const text = typeof result === 'string' ? result : JSON.stringify(result);
+  if (!text) return `${toolName} 已完成`;
+
+  if (toolName === 'read_file' || toolName === 'parse_file') {
+    return `${toolName} 已读取 ${text.length} 字符`;
+  }
+
+  if (toolName === 'execute_python') {
+    const parsed = safeJsonParse(text);
+    if (parsed) {
+      const parts = [];
+      if (parsed.stdout) parts.push(`stdout ${String(parsed.stdout).length} 字符`);
+      if (parsed.stderr) parts.push(`stderr ${String(parsed.stderr).length} 字符`);
+      if (Array.isArray(parsed.files) && parsed.files.length > 0) parts.push(`生成 ${parsed.files.length} 个文件`);
+      if (parsed.result) parts.push('返回结果');
+      return parts.length ? `Python 执行完成，${parts.join('，')}` : 'Python 执行完成';
+    }
+  }
+
+  if (toolName === 'write_file') return text;
+  if (toolName === 'download_file') return text;
+  if (toolName === 'web_search') return `搜索完成，返回约 ${text.length} 字符结果`;
+  if (toolName === 'http_get' || toolName === 'http_post') return `${toolName} 完成，返回约 ${text.length} 字符`;
+
+  return text.length > 160 ? `${text.slice(0, 160)}...` : text;
+}
+
+function normalizeArtifactPath(topicPath, artifactPath) {
+  if (!artifactPath) return null;
+  const raw = String(artifactPath);
+  const root = path.resolve(topicPath);
+
+  if (path.isAbsolute(raw)) {
+    const resolved = path.resolve(raw);
+    if (resolved === root || resolved.startsWith(root + path.sep)) {
+      return path.relative(root, resolved).replace(/\\/g, '/');
+    }
+    return raw;
+  }
+
+  return path.normalize(raw).replace(/\\/g, '/');
+}
+
+function extractArtifacts(toolName, args, result, context) {
+  const artifacts = [];
+  const add = (filePath, source) => {
+    const normalized = normalizeArtifactPath(context.topicPath, filePath);
+    if (!normalized) return;
+    artifacts.push({ path: normalized, source });
+  };
+
+  if (toolName === 'write_file' && args?.filePath) {
+    add(args.filePath, toolName);
+  }
+
+  if (toolName === 'download_file') {
+    if (args?.fileName) add(`downloads/${args.fileName}`, toolName);
+    const match = String(result || '').match(/下载完成:\s*(.+?)\s*\(/);
+    if (match) add(match[1], toolName);
+  }
+
+  if (toolName === 'browser_screenshot' && args?.fileName) {
+    add(args.fileName, toolName);
+  }
+
+  if (toolName === 'execute_python') {
+    const parsed = safeJsonParse(result);
+    if (parsed && Array.isArray(parsed.files)) {
+      for (const f of parsed.files) add(f, toolName);
+    }
+  }
+
+  return artifacts;
+}
+
+function stepForTool(plan, toolName) {
+  const byKind = (kind) => plan.find((s) => s.kind === kind) || plan[0];
+
+  if (plan.length === 2) return plan[0];
+
+  if ([
+    'web_search', 'http_get', 'http_post', 'download_file', 'parse_html',
+    'parse_file', 'read_file', 'list_files',
+  ].includes(toolName)) {
+    return byKind('gather');
+  }
+
+  if ([
+    'execute_python', 'write_file',
+  ].includes(toolName)) {
+    return byKind('process');
+  }
+
+  return byKind('process');
+}
+
+function verifyArtifacts(context, artifacts) {
+  if (!artifacts.length) {
+    return [{ label: '最终回答', ok: true, detail: '已生成可读回答' }];
+  }
+
+  return artifacts.map((artifact) => {
+    const filePath = artifact.path;
+    let ok = true;
+    let detail = '已记录产物';
+
+    try {
+      if (context.fileTools && filePath && !path.isAbsolute(filePath)) {
+        ok = context.fileTools.fileExists(context.topicPath, filePath);
+        detail = ok ? '文件存在' : '文件不存在';
+      }
+    } catch (err) {
+      ok = false;
+      detail = err.message;
+    }
+
+    return { label: filePath, ok, detail };
+  });
+}
+
+function createTaskObserver(context, conversationHistory, onProgress) {
+  const goal = getLatestUserGoal(conversationHistory);
+  const mode = shouldUsePlannedMode(goal) ? 'planned' : 'direct';
+  const taskId = createTaskId();
+  const plan = buildTaskPlan(goal, mode);
+  const state = {
+    taskId,
+    goal,
+    mode,
+    plan,
+    currentStepId: null,
+    completedSteps: new Set(),
+    artifacts: [],
+  };
+
+  const emit = (event) => onProgress?.({ taskId, ...event });
+
+  const stepById = (stepId) => plan.find((s) => s.id === stepId);
+
+  const startStep = (stepId, detail) => {
+    if (!stepId || state.currentStepId === stepId) return;
+
+    if (state.currentStepId && !state.completedSteps.has(state.currentStepId)) {
+      completeStep(state.currentStepId);
+    }
+
+    state.currentStepId = stepId;
+    const step = stepById(stepId);
+    if (!step) return;
+    step.status = 'running';
+    emit({ type: 'step_started', step: { id: step.id, title: step.title, status: step.status }, detail });
+  };
+
+  const completeStep = (stepId, detail) => {
+    const step = stepById(stepId);
+    if (!step || state.completedSteps.has(stepId)) return;
+    step.status = 'done';
+    state.completedSteps.add(stepId);
+    emit({ type: 'step_completed', step: { id: step.id, title: step.title, status: step.status }, detail });
+  };
+
+  const failStep = (stepId, detail) => {
+    const step = stepById(stepId);
+    if (!step) return;
+    step.status = 'failed';
+    state.completedSteps.add(stepId);
+    emit({ type: 'step_failed', step: { id: step.id, title: step.title, status: step.status }, detail });
+  };
+
+  const addObservation = (summary) => {
+    if (!summary) return;
+    emit({ type: 'observation_added', summary });
+  };
+
+  const addArtifacts = (artifacts) => {
+    for (const artifact of artifacts) {
+      if (!artifact?.path) continue;
+      const exists = state.artifacts.some((a) => a.path === artifact.path);
+      if (exists) continue;
+      state.artifacts.push(artifact);
+      emit({ type: 'artifact_created', artifact });
+    }
+  };
+
+  emit({
+    type: 'task_created',
+    task: {
+      id: taskId,
+      goal,
+      mode,
+      status: 'running',
+      startedAt: new Date().toISOString(),
+    },
+  });
+  emit({ type: 'plan_created', mode, plan: publicPlan(plan) });
+  startStep(plan[0].id, mode === 'planned' ? '建立执行路径' : '准备直接处理');
+
+  return {
+    taskId,
+    beforeTool(toolName, rawArgs) {
+      const args = safeJsonParse(rawArgs) || {};
+      if (state.currentStepId === plan[0].id) {
+        completeStep(plan[0].id, '已选择工具执行路径');
+      }
+      const step = stepForTool(plan, toolName);
+      startStep(step.id, summarizeToolArgs(toolName, args));
+    },
+    afterTool(toolName, rawArgs, result, error) {
+      const args = safeJsonParse(rawArgs) || {};
+      if (error && state.currentStepId) {
+        failStep(state.currentStepId, error);
+      }
+      addObservation(summarizeToolResult(toolName, result, error));
+      addArtifacts(extractArtifacts(toolName, args, result, context));
+    },
+    finish() {
+      if (state.currentStepId && state.currentStepId !== 'step_verify') {
+        completeStep(state.currentStepId);
+      }
+
+      const verifyStep = plan.find((s) => s.kind === 'verify') || plan[plan.length - 1];
+      startStep(verifyStep.id, '检查关键产物和最终回答');
+      emit({ type: 'verification_started', artifacts: state.artifacts });
+      const checks = verifyArtifacts(context, state.artifacts);
+      emit({ type: 'verification_finished', checks });
+      completeStep(verifyStep.id, checks.every((c) => c.ok) ? '验证通过' : '部分检查未通过');
+
+      emit({
+        type: 'task_completed',
+        task: {
+          id: taskId,
+          goal,
+          mode,
+          status: 'completed',
+          artifacts: state.artifacts,
+          completedAt: new Date().toISOString(),
+        },
+      });
+
+      return {
+        id: taskId,
+        goal,
+        mode,
+        artifacts: state.artifacts,
+        checks,
+      };
+    },
+    fail(message) {
+      if (state.currentStepId) failStep(state.currentStepId, message);
+      emit({
+        type: 'task_completed',
+        task: {
+          id: taskId,
+          goal,
+          mode,
+          status: 'failed',
+          artifacts: state.artifacts,
+          completedAt: new Date().toISOString(),
+        },
+      });
+    },
+  };
+}
+
+// ============================================================
 // Agent 主循环
 // ============================================================
 
@@ -494,6 +822,13 @@ async function executeToolCall(toolName, toolArgs, context) {
  * @param {function} [callbacks.onResponse] - (text) => void（兼容旧接口）
  * @param {function} [callbacks.onProgress] - (event) => void（流式进度事件）
  *   事件类型：
+ *     { type: 'task_created', task }         — 创建可观察任务
+ *     { type: 'plan_created', plan }         — 生成轻量执行计划
+ *     { type: 'step_started', step }         — 步骤开始
+ *     { type: 'observation_added', summary } — 工具观察摘要
+ *     { type: 'artifact_created', artifact } — 产物记录
+ *     { type: 'verification_finished', checks } — 验证完成
+ *     { type: 'task_completed', task }       — 任务完成
  *     { type: 'llm_request', iteration }     — 发起 LLM 调用
  *     { type: 'text_delta', text }           — 流式文本增量
  *     { type: 'tool_start', name, args }     — 工具开始执行
@@ -506,7 +841,9 @@ async function runAgentLoop(context, conversationHistory, callbacks = {}) {
   const { onToolCall, onResponse, onProgress } = callbacks;
   const tools = TOOL_DEFINITIONS;
   const usages = [];
+  const taskObserver = createTaskObserver(context, conversationHistory, onProgress);
   let iterations = 0;
+  let taskResult = null;
 
   while (iterations < MAX_LLM_ITERATIONS) {
     iterations++;
@@ -524,8 +861,9 @@ async function runAgentLoop(context, conversationHistory, callbacks = {}) {
     if (!message.tool_calls || message.tool_calls.length === 0) {
       const content = message.content || '';
       onResponse?.(content);
+      taskResult = taskObserver.finish();
       onProgress?.({ type: 'done' });
-      return { messages: conversationHistory, usage: usages };
+      return { messages: conversationHistory, usage: usages, task: taskResult };
     }
 
     // 执行 tool calls（逐个执行，实时推送结果）
@@ -534,6 +872,7 @@ async function runAgentLoop(context, conversationHistory, callbacks = {}) {
       const toolArgs = tc.function.arguments;
 
       onToolCall?.(toolName, toolArgs);
+      taskObserver.beforeTool(toolName, toolArgs);
       onProgress?.({ type: 'tool_start', name: toolName, args: toolArgs });
 
       let toolResult;
@@ -544,6 +883,7 @@ async function runAgentLoop(context, conversationHistory, callbacks = {}) {
         toolResult = `工具执行错误: ${err.message}`;
         toolError = err.message;
       }
+      taskObserver.afterTool(toolName, toolArgs, toolResult, toolError);
 
       onProgress?.({
         type: 'tool_end',
@@ -566,8 +906,9 @@ async function runAgentLoop(context, conversationHistory, callbacks = {}) {
   const lastMsg = conversationHistory[conversationHistory.length - 1];
   const content = (lastMsg.role === 'assistant' && lastMsg.content) || '执行超过最大步数，请简化请求。';
   onResponse?.(content);
+  taskObserver.fail('执行超过最大步数');
   onProgress?.({ type: 'done' });
-  return { messages: conversationHistory, usage: usages };
+  return { messages: conversationHistory, usage: usages, task: taskResult };
 }
 
 // ============================================================
@@ -614,7 +955,7 @@ function estimateTokens(messages) {
  *   - 中间部分用 LLM 生成一段中文摘要替代
  *
  * @param {object[]} messages - 完整的消息数组（会被读取但不会被原地修改）
- * @param {number} [threshold=50000] - 触发压缩的 token 阈值
+ * @param {number} [threshold=80000] - 触发压缩的 token 阈值
  * @returns {Promise<object[]>} 压缩后的新数组（若无需压缩则返回原数组）
  */
 async function compressHistory(messages, threshold = COMPRESS_THRESHOLD) {

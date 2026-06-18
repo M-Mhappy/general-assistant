@@ -12,6 +12,7 @@ require('dotenv').config();
 
 const { app, BrowserWindow, ipcMain, shell, dialog } = require('electron');
 const path = require('path');
+const fs = require('fs');
 const topicManager = require('./modules/topic-manager');
 const fileTools = require('./modules/file-tools');
 const httpTools = require('./modules/http-tools');
@@ -32,10 +33,10 @@ let mainWindow = null;
 
 function createWindow() {
   mainWindow = new BrowserWindow({
-    width: 1000,
-    height: 700,
-    minWidth: 600,
-    minHeight: 400,
+    width: 1240,
+    height: 760,
+    minWidth: 1080,
+    minHeight: 560,
     title: '个人通用助手',
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
@@ -96,6 +97,16 @@ ipcMain.handle('topic:getMeta', (_event, topicId) => {
   return { success: true, data: meta };
 });
 
+ipcMain.handle('topic:delete', (_event, { topicId }) => {
+  try {
+    topicManager.deleteTopic(topicId);
+    conversationCache.delete(topicId);
+    return { success: true };
+  } catch (err) {
+    return { success: false, error: err.message };
+  }
+});
+
 // ============================================================
 // IPC 路由 — 文件工具
 // ============================================================
@@ -106,6 +117,96 @@ ipcMain.handle('topic:getMeta', (_event, topicId) => {
  */
 function getTopicPath(topicId) {
   return topicManager.getTopicPath(topicId);
+}
+
+const PREVIEW_TEXT_LIMIT = 1024 * 1024;       // 1MB
+const PREVIEW_IMAGE_LIMIT = 20 * 1024 * 1024; // 20MB
+const TEXT_PREVIEW_EXTS = new Set([
+  '.txt', '.md', '.csv', '.json', '.css', '.js', '.ts', '.py', '.xml',
+  '.yaml', '.yml', '.log', '.sh', '.bat', '.ps1', '.ini', '.cfg', '.toml',
+]);
+const HTML_PREVIEW_EXTS = new Set(['.html', '.htm']);
+const IMAGE_MIME_BY_EXT = {
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.gif': 'image/gif',
+  '.webp': 'image/webp',
+  '.svg': 'image/svg+xml',
+  '.ico': 'image/x-icon',
+};
+
+function normalizeRelativePath(topicPath, filePath) {
+  const resolved = fileTools.resolveSafe(topicPath, filePath);
+  return path.relative(topicPath, resolved).replace(/\\/g, '/');
+}
+
+function buildPreviewPayload(topicPath, filePath) {
+  const fullPath = fileTools.resolveSafe(topicPath, filePath);
+  if (!fs.existsSync(fullPath)) {
+    throw new Error(`文件不存在: ${filePath}`);
+  }
+
+  const stat = fs.statSync(fullPath);
+  if (stat.isDirectory()) {
+    throw new Error(`目标路径是目录而非文件: ${filePath}`);
+  }
+
+  const ext = path.extname(fullPath).toLowerCase();
+  const base = {
+    filePath: normalizeRelativePath(topicPath, filePath),
+    name: path.basename(fullPath),
+    ext,
+    size: stat.size,
+    mtime: stat.mtime.toISOString(),
+    truncated: false,
+  };
+
+  if (HTML_PREVIEW_EXTS.has(ext) || TEXT_PREVIEW_EXTS.has(ext)) {
+    const truncated = stat.size > PREVIEW_TEXT_LIMIT;
+    const readSize = Math.min(stat.size, PREVIEW_TEXT_LIMIT);
+    const raw = Buffer.alloc(readSize);
+    const fd = fs.openSync(fullPath, 'r');
+    try {
+      fs.readSync(fd, raw, 0, readSize, 0);
+    } finally {
+      fs.closeSync(fd);
+    }
+    const content = raw.toString('utf-8');
+    return {
+      ...base,
+      kind: HTML_PREVIEW_EXTS.has(ext) ? 'html' : 'text',
+      mime: HTML_PREVIEW_EXTS.has(ext) ? 'text/html' : 'text/plain',
+      content,
+      truncated,
+    };
+  }
+
+  if (IMAGE_MIME_BY_EXT[ext]) {
+    if (stat.size > PREVIEW_IMAGE_LIMIT) {
+      return {
+        ...base,
+        kind: 'unsupported',
+        mime: IMAGE_MIME_BY_EXT[ext],
+        message: `图片过大，无法预览（${Math.round(stat.size / 1024 / 1024)} MB）`,
+      };
+    }
+
+    const data = fs.readFileSync(fullPath).toString('base64');
+    return {
+      ...base,
+      kind: 'image',
+      mime: IMAGE_MIME_BY_EXT[ext],
+      dataUrl: `data:${IMAGE_MIME_BY_EXT[ext]};base64,${data}`,
+    };
+  }
+
+  return {
+    ...base,
+    kind: 'unsupported',
+    mime: 'application/octet-stream',
+    message: '该文件类型暂不支持内嵌预览',
+  };
 }
 
 ipcMain.handle('file:list', (_event, { topicId, subPath }) => {
@@ -123,6 +224,16 @@ ipcMain.handle('file:read', (_event, { topicId, filePath }) => {
     const topicPath = getTopicPath(topicId);
     const content = fileTools.readFile(topicPath, filePath);
     return { success: true, data: content };
+  } catch (err) {
+    return { success: false, error: err.message };
+  }
+});
+
+ipcMain.handle('file:preview', (_event, { topicId, filePath }) => {
+  try {
+    const topicPath = getTopicPath(topicId);
+    const preview = buildPreviewPayload(topicPath, filePath);
+    return { success: true, data: preview };
   } catch (err) {
     return { success: false, error: err.message };
   }
@@ -214,7 +325,7 @@ ipcMain.handle('http:saveResponse', (_event, { topicId, data, filePath, format }
 ipcMain.handle('file:getPath', (_event, { topicId, filePath }) => {
   try {
     const topicPath = getTopicPath(topicId);
-    const fullPath = require('path').join(topicPath, filePath);
+    const fullPath = fileTools.resolveSafe(topicPath, filePath);
     return { success: true, data: fullPath };
   } catch (err) {
     return { success: false, error: err.message };
@@ -224,7 +335,7 @@ ipcMain.handle('file:getPath', (_event, { topicId, filePath }) => {
 ipcMain.handle('file:open', async (_event, { topicId, filePath }) => {
   try {
     const topicPath = getTopicPath(topicId);
-    const fullPath = require('path').join(topicPath, filePath);
+    const fullPath = fileTools.resolveSafe(topicPath, filePath);
     const result = await shell.openPath(fullPath);
     if (result) throw new Error(result); // shell.openPath 返回错误字符串或空字符串
     return { success: true };
@@ -293,7 +404,7 @@ ipcMain.handle('file:upload', async (_event, { topicId }) => {
 ipcMain.handle('file:parse', async (_event, { topicId, filePath }) => {
   try {
     const topicPath = getTopicPath(topicId);
-    const fullPath = pathLib.join(topicPath, filePath);
+    const fullPath = fileTools.resolveSafe(topicPath, filePath);
 
     // 确保 Python 执行器已启动
     if (!pythonExecutor.ready && !pythonExecutor.process) {
@@ -456,7 +567,15 @@ function buildSystemMessage() {
 - 优先使用 web_search 获取信息，HTTP/API 获取具体页面详情
 - 遇到登录、验证码、支付、删除账号等敏感操作时，必须停止并告知用户
 - 生成 HTML 页面、Markdown 文档时，使用 write_file 工具保存到 output/ 目录
-- 生成的 Python 代码应保存在 code/ 目录`,
+- 生成的 Python 代码应保存在 code/ 目录
+
+执行范式：
+- 简单任务直接执行，并在完成后简要说明结果
+- 多步骤任务先形成 2-5 步的轻量计划，再逐步调用工具执行
+- 每次工具返回后，根据观察结果调整下一步，不要机械执行过期计划
+- 需要生成文件时，保存后检查文件是否存在、格式是否符合用户要求
+- 最终回答只展示结论、关键观察、生成文件和必要的后续建议
+- 不展示完整内部思考链；如果需要说明原因，用简短、可验证的执行摘要表达`,
   };
 }
 
@@ -560,6 +679,7 @@ ipcMain.handle('agent:chat', async (_event, { topicId, message }) => {
       data: {
         response: finalResponse,
         toolCalls,
+        task: result.task || null,
         usage: result.usage[result.usage.length - 1] || null,
       },
     };

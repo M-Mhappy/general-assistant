@@ -13,6 +13,7 @@ contextBridge.exposeInMainWorld('api', {
     create: (title) => ipcRenderer.invoke('topic:create', title),
     list: () => ipcRenderer.invoke('topic:list'),
     getMeta: (topicId) => ipcRenderer.invoke('topic:getMeta', topicId),
+    delete: (topicId) => ipcRenderer.invoke('topic:delete', { topicId }),
   },
 
   // ---- File Tools ----
@@ -21,6 +22,8 @@ contextBridge.exposeInMainWorld('api', {
       ipcRenderer.invoke('file:list', { topicId, subPath }),
     read: (topicId, filePath) =>
       ipcRenderer.invoke('file:read', { topicId, filePath }),
+    preview: (topicId, filePath) =>
+      ipcRenderer.invoke('file:preview', { topicId, filePath }),
     write: (topicId, filePath, content) =>
       ipcRenderer.invoke('file:write', { topicId, filePath, content }),
     delete: (topicId, filePath) =>

@@ -67,6 +67,30 @@ def _ast_contains_call_or_assignment(node: ast.AST) -> bool:
     return False
 
 
+def _snapshot_workspace_files(root: str) -> dict[str, tuple[int, int]]:
+    """记录 workspace 内文件的相对路径、修改时间和大小。"""
+    snapshot = {}
+    root_path = Path(root)
+    if not root_path.exists():
+        return snapshot
+
+    skipped_dirs = {".git", "__pycache__"}
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in skipped_dirs]
+        for name in filenames:
+            if name.endswith((".pyc", ".pyo")):
+                continue
+            full_path = Path(dirpath) / name
+            try:
+                stat = full_path.stat()
+                rel = full_path.relative_to(root_path).as_posix()
+                snapshot[rel] = (stat.st_mtime_ns, stat.st_size)
+            except Exception:
+                continue
+
+    return snapshot
+
+
 def install_package(package_name: str) -> tuple[bool, str]:
     """使用 pip 安装包，返回 (success, output)。"""
     try:
@@ -244,6 +268,7 @@ class CodeExecutor:
         original_cwd = os.getcwd()
         if cwd and os.path.isdir(cwd):
             os.chdir(cwd)
+        before_files = _snapshot_workspace_files(cwd) if cwd and os.path.isdir(cwd) else {}
 
         # 捕获 stdout/stderr 实现实时流式输出
         old_stdout = sys.stdout
@@ -324,9 +349,10 @@ class CodeExecutor:
             # 收集执行期间生成的文件（相对路径）
             if cwd:
                 try:
-                    for f in os.listdir(cwd):
-                        if os.path.isfile(os.path.join(cwd, f)):
-                            files.append(f)
+                    after_files = _snapshot_workspace_files(cwd)
+                    for rel_path, meta in sorted(after_files.items()):
+                        if rel_path not in before_files or before_files[rel_path] != meta:
+                            files.append(rel_path)
                 except Exception:
                     pass
 

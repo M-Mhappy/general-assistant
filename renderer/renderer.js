@@ -19,6 +19,7 @@ const $topicList = document.getElementById('topic-list');
 const $topicLabel = document.getElementById('current-topic-label');
 const $messages = document.getElementById('messages');
 const $fileList = document.getElementById('file-list');
+const $artifactPreview = document.getElementById('artifact-preview');
 const $userInput = document.getElementById('user-input');
 const $btnSend = document.getElementById('btn-send');
 const $btnNewTopic = document.getElementById('btn-new-topic');
@@ -38,17 +39,63 @@ async function loadTopics() {
 
   topics.forEach((t) => {
     const li = document.createElement('li');
-    li.textContent = t.meta?.title || `Topic ${t.id}`;
+    const title = t.meta?.title || `Topic ${t.id}`;
+    li.innerHTML = `
+      <span class="topic-title"></span>
+      <button class="topic-delete" type="button" title="删除会话" aria-label="删除会话">×</button>
+    `;
+    li.querySelector('.topic-title').textContent = title;
     li.dataset.topicId = t.id;
     li.addEventListener('click', () => selectTopic(t.id));
+    li.querySelector('.topic-delete').addEventListener('click', (e) => {
+      e.stopPropagation();
+      deleteTopic(t.id, title);
+    });
     if (t.id === currentTopicId) li.classList.add('active');
     $topicList.appendChild(li);
   });
 }
 
+async function deleteTopic(topicId, title) {
+  if (!topicId) return;
+
+  const confirmed = confirm(`确定要删除会话 "${title}" 吗？\n\n该会话的对话记录和 Topic workspace 文件都会被删除。`);
+  if (!confirmed) return;
+
+  const result = await window.api.topic.delete(topicId);
+  if (!result.success) {
+    addNotice(`删除会话失败: ${result.error}`);
+    return;
+  }
+
+  addNotice(`已删除会话: ${title}`);
+
+  const listResult = await window.api.topic.list();
+  const remaining = listResult.success ? listResult.data : [];
+
+  if (topicId === currentTopicId) {
+    $messages.innerHTML = '';
+    selectedArtifactPath = null;
+    clearArtifactPreview();
+
+    if (remaining.length > 0) {
+      await selectTopic(remaining[0].id);
+    } else {
+      const created = await window.api.topic.create();
+      if (created.success) await selectTopic(created.data.id);
+    }
+    return;
+  }
+
+  await loadTopics();
+}
+
 async function selectTopic(topicId) {
   currentTopicId = topicId;
+  currentViewPath = '';
+  selectedArtifactPath = null;
   $topicLabel.textContent = `当前 Topic: ${topicId}`;
+  clearArtifactPreview();
   loadTopics();           // 刷新 active 样式
   refreshFileList();
 
@@ -61,7 +108,9 @@ async function ensureTopic() {
   const result = await window.api.topic.getOrCreate();
   if (result.success) {
     currentTopicId = result.data.id;
+    selectedArtifactPath = null;
     $topicLabel.textContent = `当前 Topic: ${currentTopicId}`;
+    clearArtifactPreview();
     await loadTopics();
     await refreshFileList();
     await loadConversationHistory(currentTopicId);
@@ -168,6 +217,14 @@ function addNotice(text) {
 // ============================================================
 
 let currentViewPath = ''; // 文件列表中当前浏览的子路径
+let selectedArtifactPath = null;
+let currentPreviewBlobUrl = null;
+
+function getFileBadge(name, type) {
+  if (type === 'directory') return 'DIR';
+  const ext = name.includes('.') ? name.split('.').pop().toUpperCase() : 'FILE';
+  return ext.slice(0, 4);
+}
 
 async function refreshFileList(subPath) {
   if (subPath !== undefined) currentViewPath = subPath;
@@ -175,6 +232,7 @@ async function refreshFileList(subPath) {
 
   if (!currentTopicId) {
     $fileList.innerHTML = '<li style="color:var(--text-muted)">—</li>';
+    clearArtifactPreview();
     return;
   }
 
@@ -190,7 +248,7 @@ async function refreshFileList(subPath) {
   if (viewPath) {
     const backLi = document.createElement('li');
     backLi.className = 'file-nav-back';
-    backLi.innerHTML = '<span class="file-icon">📂</span> .. (上级目录)';
+    backLi.innerHTML = '<span class="file-icon">UP</span> .. (上级目录)';
     backLi.addEventListener('click', () => {
       const parent = viewPath.split('/').slice(0, -1).join('/') || '';
       refreshFileList(parent);
@@ -211,21 +269,24 @@ async function refreshFileList(subPath) {
 
   sorted.forEach((f) => {
     const li = document.createElement('li');
-    const icon = f.type === 'directory' ? '📁' : '📄';
+    const badge = getFileBadge(f.name, f.type);
     const childPath = viewPath ? `${viewPath}/${f.name}` : f.name;
 
     li.innerHTML = `
-      <span class="file-icon">${icon}</span>
+      <span class="file-icon">${escapeHtml(badge)}</span>
       <span class="file-name">${f.name}</span>
       ${f.type === 'file' ? `
         <span class="file-actions">
-          <button class="btn-download" title="用默认程序打开">📥</button>
-          <button class="btn-delete" title="删除文件">🗑</button>
+          <button class="btn-download" type="button" title="用默认程序打开" aria-label="用默认程序打开">↗</button>
+          <button class="btn-delete" type="button" title="删除文件" aria-label="删除文件">×</button>
         </span>
       ` : ''}
     `;
 
     if (f.type === 'directory') li.classList.add('file-dir');
+    if (f.type === 'file' && childPath === selectedArtifactPath) {
+      li.classList.add('selected');
+    }
     li.title = `${f.name}\n类型: ${f.type}\n大小: ${f.size} B\n修改: ${f.mtime}`;
 
     // 点击文件名 → 预览 / 进入目录
@@ -253,6 +314,10 @@ async function refreshFileList(subPath) {
           const res = await window.api.file.delete(currentTopicId, childPath);
           if (res.success) {
             addNotice(`已删除: ${f.name}`);
+            if (selectedArtifactPath === childPath) {
+              selectedArtifactPath = null;
+              clearArtifactPreview();
+            }
             refreshFileList(viewPath);
           } else {
             addNotice(`删除失败: ${res.error}`);
@@ -265,30 +330,144 @@ async function refreshFileList(subPath) {
   });
 }
 
-/**
- * 预览文件内容（在消息区显示）。
- */
-async function previewFile(filePath) {
-  const ext = filePath.split('.').pop().toLowerCase();
-  const textExts = ['txt', 'md', 'json', 'csv', 'html', 'css', 'js', 'py', 'xml', 'yaml', 'yml', 'log', 'sh', 'bat', 'ini', 'cfg'];
-  const imageExts = ['png', 'jpg', 'jpeg', 'gif', 'svg', 'ico', 'webp'];
+function formatBytes(size) {
+  if (size < 1024) return `${size} B`;
+  if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KB`;
+  return `${(size / 1024 / 1024).toFixed(1)} MB`;
+}
 
-  if (imageExts.includes(ext)) {
-    addMessage('assistant', `[图片文件] ${filePath}\n（MVP 暂不支持图片预览，可在文件管理器中打开）`, `file:${filePath}`);
-    return;
+function clearArtifactPreview(text = '选择文件预览') {
+  if (!$artifactPreview) return;
+  revokePreviewBlobUrl();
+  $artifactPreview.className = 'artifact-preview empty';
+  $artifactPreview.innerHTML = `<div class="preview-empty">${escapeHtml(text)}</div>`;
+}
+
+function revokePreviewBlobUrl() {
+  if (currentPreviewBlobUrl) {
+    URL.revokeObjectURL(currentPreviewBlobUrl);
+    currentPreviewBlobUrl = null;
   }
+}
 
-  const result = await window.api.file.read(currentTopicId, filePath);
-  if (result.success) {
-    const content = result.data;
-    const truncated = content.length > 5000 ? '\n\n...(内容过长，已截断)' : '';
-    const display = content.slice(0, 5000) + truncated;
-    const langMap = { md: 'markdown', js: 'javascript', py: 'python', json: 'json', html: 'html', css: 'css' };
-    const lang = langMap[ext] || '';
-    const codeBlock = '```' + lang + '\n' + display + '\n```';
-    addMessage('assistant', codeBlock, `📄 ${filePath} (${content.length} 字符)`);
+function createPreviewHeader(preview) {
+  const header = document.createElement('div');
+  header.className = 'preview-header';
+
+  const titleWrap = document.createElement('div');
+  titleWrap.className = 'preview-title-wrap';
+
+  const title = document.createElement('div');
+  title.className = 'preview-title';
+  title.textContent = preview.name;
+
+  const meta = document.createElement('div');
+  meta.className = 'preview-meta';
+  meta.textContent = `${preview.filePath} · ${formatBytes(preview.size)}`;
+
+  titleWrap.appendChild(title);
+  titleWrap.appendChild(meta);
+
+  const openBtn = document.createElement('button');
+  openBtn.className = 'preview-open';
+  openBtn.textContent = '打开';
+  openBtn.title = '用默认程序打开';
+  openBtn.addEventListener('click', () => downloadFile(preview.filePath));
+
+  header.appendChild(titleWrap);
+  header.appendChild(openBtn);
+  return header;
+}
+
+function renderTextPreview(preview, body) {
+  const pre = document.createElement('pre');
+  pre.className = 'preview-text';
+  pre.textContent = preview.content || '';
+  body.appendChild(pre);
+
+  if (preview.truncated) {
+    const note = document.createElement('div');
+    note.className = 'preview-note';
+    note.textContent = '内容过长，预览已截断。';
+    body.appendChild(note);
+  }
+}
+
+function renderHtmlPreview(preview, body) {
+  const iframe = document.createElement('iframe');
+  iframe.className = 'preview-html-frame';
+  iframe.setAttribute('sandbox', '');
+  const blob = new Blob([preview.content || ''], { type: 'text/html' });
+  currentPreviewBlobUrl = URL.createObjectURL(blob);
+  iframe.src = currentPreviewBlobUrl;
+  body.appendChild(iframe);
+
+  if (preview.truncated) {
+    const note = document.createElement('div');
+    note.className = 'preview-note';
+    note.textContent = 'HTML 内容过长，预览已截断。';
+    body.appendChild(note);
+  }
+}
+
+function renderImagePreview(preview, body) {
+  const wrap = document.createElement('div');
+  wrap.className = 'preview-image-wrap';
+
+  const img = document.createElement('img');
+  img.className = 'preview-image';
+  img.src = preview.dataUrl;
+  img.alt = preview.name;
+
+  wrap.appendChild(img);
+  body.appendChild(wrap);
+}
+
+function renderUnsupportedPreview(preview, body) {
+  const msg = document.createElement('div');
+  msg.className = 'preview-empty';
+  msg.textContent = preview.message || '该文件类型暂不支持预览。';
+  body.appendChild(msg);
+}
+
+function renderArtifactPreview(preview) {
+  revokePreviewBlobUrl();
+  $artifactPreview.className = `artifact-preview ${preview.kind}`;
+  $artifactPreview.innerHTML = '';
+  $artifactPreview.appendChild(createPreviewHeader(preview));
+
+  const body = document.createElement('div');
+  body.className = 'preview-body';
+  $artifactPreview.appendChild(body);
+
+  if (preview.kind === 'html') {
+    renderHtmlPreview(preview, body);
+  } else if (preview.kind === 'image') {
+    renderImagePreview(preview, body);
+  } else if (preview.kind === 'text') {
+    renderTextPreview(preview, body);
   } else {
-    addMessage('assistant', `❌ 无法读取: ${result.error}`, `file:${filePath}`);
+    renderUnsupportedPreview(preview, body);
+  }
+}
+
+/**
+ * 在右侧 Artifact 面板预览文件。
+ */
+async function previewFile(filePath, opts = {}) {
+  if (!currentTopicId || !filePath) return;
+
+  selectedArtifactPath = filePath;
+  $artifactPreview.className = 'artifact-preview loading';
+  $artifactPreview.innerHTML = `<div class="preview-empty">正在预览 ${escapeHtml(filePath)}...</div>`;
+
+  const result = await window.api.file.preview(currentTopicId, filePath);
+  if (result.success) {
+    renderArtifactPreview(result.data);
+    refreshFileList();
+  } else {
+    clearArtifactPreview(`无法预览: ${result.error}`);
+    if (!opts.silent) addNotice(`预览失败: ${result.error}`);
   }
 }
 
@@ -356,6 +535,11 @@ let isProcessing = false;
 // 流式输出状态
 let currentToolChain = null;    // 本轮工具链容器 DOM
 let currentToolCards = {};      // cardId -> { card, name }
+let currentTaskPanel = null;    // 本轮任务面板 DOM
+let currentTaskSteps = {};      // stepId -> li
+let currentTaskObservations = null;
+let currentTaskArtifacts = null;
+let currentTaskChecks = null;
 let currentStreamMsg = null;    // 流式助手消息 DOM
 let currentStreamText = '';     // 流式文本累积
 let progressCleanup = null;     // 进度监听清理函数
@@ -383,12 +567,138 @@ function createToolChain() {
 }
 
 /**
+ * 创建任务执行面板。
+ */
+function createTaskPanel(event) {
+  const task = event.task || {};
+  const panel = document.createElement('div');
+  panel.className = 'task-panel';
+  panel.dataset.taskId = task.id || '';
+
+  const modeLabel = task.mode === 'planned' ? '计划执行' : '直接执行';
+  panel.innerHTML = `
+    <div class="task-header">
+      <div>
+        <div class="task-kicker">执行过程</div>
+        <div class="task-goal">${escapeHtml(task.goal || '处理用户请求')}</div>
+      </div>
+      <span class="task-mode">${escapeHtml(modeLabel)}</span>
+    </div>
+    <ol class="task-steps"></ol>
+    <div class="task-meta-block task-observations" hidden>
+      <div class="task-meta-title">观察</div>
+      <ul></ul>
+    </div>
+    <div class="task-meta-block task-artifacts" hidden>
+      <div class="task-meta-title">产物</div>
+      <ul></ul>
+    </div>
+    <div class="task-meta-block task-checks" hidden>
+      <div class="task-meta-title">验证</div>
+      <ul></ul>
+    </div>
+  `;
+
+  $messages.appendChild(panel);
+  currentTaskPanel = panel;
+  currentTaskSteps = {};
+  currentTaskObservations = panel.querySelector('.task-observations');
+  currentTaskArtifacts = panel.querySelector('.task-artifacts');
+  currentTaskChecks = panel.querySelector('.task-checks');
+  $messages.scrollTop = $messages.scrollHeight;
+}
+
+function renderTaskPlan(event) {
+  if (!currentTaskPanel) return;
+  const list = currentTaskPanel.querySelector('.task-steps');
+  list.innerHTML = '';
+  currentTaskSteps = {};
+
+  (event.plan || []).forEach((step) => {
+    const li = document.createElement('li');
+    li.className = 'task-step pending';
+    li.dataset.stepId = step.id;
+    li.innerHTML = `
+      <span class="task-step-marker"></span>
+      <span class="task-step-title">${escapeHtml(step.title)}</span>
+      <span class="task-step-status">等待</span>
+    `;
+    list.appendChild(li);
+    currentTaskSteps[step.id] = li;
+  });
+}
+
+function updateTaskStep(event, status) {
+  if (!currentTaskPanel || !event.step) return;
+  const step = currentTaskSteps[event.step.id];
+  if (!step) return;
+
+  step.className = `task-step ${status}`;
+  const label = step.querySelector('.task-step-status');
+  const labels = {
+    running: '进行中',
+    done: '完成',
+    failed: '失败',
+    pending: '等待',
+  };
+  label.textContent = labels[status] || status;
+
+  if (event.detail) {
+    step.title = event.detail;
+  }
+  $messages.scrollTop = $messages.scrollHeight;
+}
+
+function appendTaskListItem(block, text, className) {
+  if (!block) return;
+  block.hidden = false;
+  const ul = block.querySelector('ul');
+  const li = document.createElement('li');
+  li.textContent = text;
+  if (className) li.className = className;
+  ul.appendChild(li);
+  $messages.scrollTop = $messages.scrollHeight;
+}
+
+function addTaskObservation(summary) {
+  if (!summary) return;
+  appendTaskListItem(currentTaskObservations, summary);
+}
+
+function addTaskArtifact(artifact) {
+  if (!artifact?.path) return;
+  const source = artifact.source ? ` (${artifact.source})` : '';
+  appendTaskListItem(currentTaskArtifacts, `${artifact.path}${source}`);
+}
+
+function renderTaskChecks(checks) {
+  if (!currentTaskChecks) return;
+  currentTaskChecks.hidden = false;
+  const ul = currentTaskChecks.querySelector('ul');
+  ul.innerHTML = '';
+  (checks || []).forEach((check) => {
+    const li = document.createElement('li');
+    li.className = check.ok ? 'check-ok' : 'check-failed';
+    li.textContent = `${check.label}: ${check.detail}`;
+    ul.appendChild(li);
+  });
+}
+
+function finishTaskPanel(task) {
+  if (!currentTaskPanel) return;
+  currentTaskPanel.classList.remove('running', 'failed', 'completed');
+  currentTaskPanel.classList.add(task?.status === 'failed' ? 'failed' : 'completed');
+  const mode = currentTaskPanel.querySelector('.task-mode');
+  if (mode) mode.textContent = task?.status === 'failed' ? '失败' : '完成';
+}
+
+/**
  * 添加 LLM 轮次标记。
  */
 function addIterationBadge(chain, iteration) {
   const badge = document.createElement('div');
   badge.className = 'iter-badge';
-  badge.textContent = `🔄 第 ${iteration} 轮`;
+  badge.textContent = `第 ${iteration} 轮`;
   chain.appendChild(badge);
   $messages.scrollTop = $messages.scrollHeight;
 }
@@ -418,10 +728,9 @@ function addToolCard(chain, event) {
   card.innerHTML = `
     <div class="tool-card-header">
       <span class="tool-toggle">▼</span>
-      <span class="tool-icon">🔧</span>
       <span class="tool-name">${escapeHtml(event.name)}</span>
       <span class="tool-args-preview">${escapeHtml(argsPreview)}</span>
-      <span class="tool-status running">⏳</span>
+      <span class="tool-status running">运行中</span>
     </div>
     <div class="tool-card-body">
       <div class="tool-args-full"><code>${escapeHtml(event.args.slice(0, 500))}</code></div>
@@ -455,12 +764,12 @@ function updateToolCard(event) {
 
     if (event.error) {
       statusEl.className = 'tool-status error';
-      statusEl.textContent = '❌ 失败';
+      statusEl.textContent = '失败';
       resultEl.className = 'tool-result error';
       resultEl.textContent = event.error;
     } else {
       statusEl.className = 'tool-status done';
-      statusEl.textContent = '✓';
+      statusEl.textContent = '完成';
       resultEl.className = 'tool-result';
 
       // parse_file / read_file 等读取类工具，只显示摘要统计，不重复展示全文内容
@@ -527,6 +836,45 @@ function finalizeStream() {
  */
 function handleProgress(event) {
   switch (event.type) {
+    case 'task_created':
+      createTaskPanel(event);
+      break;
+
+    case 'plan_created':
+      renderTaskPlan(event);
+      break;
+
+    case 'step_started':
+      updateTaskStep(event, 'running');
+      break;
+
+    case 'step_completed':
+      updateTaskStep(event, 'done');
+      break;
+
+    case 'step_failed':
+      updateTaskStep(event, 'failed');
+      break;
+
+    case 'observation_added':
+      addTaskObservation(event.summary);
+      break;
+
+    case 'artifact_created':
+      addTaskArtifact(event.artifact);
+      if (event.artifact?.path) {
+        previewFile(event.artifact.path, { silent: true });
+      }
+      break;
+
+    case 'verification_finished':
+      renderTaskChecks(event.checks);
+      break;
+
+    case 'task_completed':
+      finishTaskPanel(event.task);
+      break;
+
     case 'llm_request':
       if (!currentToolChain) currentToolChain = createToolChain();
       addIterationBadge(currentToolChain, event.iteration);
@@ -553,7 +901,7 @@ function handleProgress(event) {
       break;
 
     case 'error':
-      addNotice(`⚠️ ${event.message}`);
+      addNotice(event.message);
       break;
   }
 }
@@ -587,6 +935,11 @@ async function handleSend() {
   // 重置流式状态
   currentToolChain = null;
   currentToolCards = {};
+  currentTaskPanel = null;
+  currentTaskSteps = {};
+  currentTaskObservations = null;
+  currentTaskArtifacts = null;
+  currentTaskChecks = null;
   currentStreamMsg = null;
   currentStreamText = '';
   streamingHandled = false;
@@ -598,7 +951,7 @@ async function handleSend() {
   isProcessing = true;
   $btnSend.disabled = true;
   $btnSend.textContent = '…';
-  setAgentStatus('warn', '🟡 处理中…');
+  setAgentStatus('warn', '处理中...');
 
   try {
     const result = await window.api.agent.chat(currentTopicId, text);
@@ -607,7 +960,7 @@ async function handleSend() {
     if (progressCleanup) { progressCleanup(); progressCleanup = null; }
 
     if (result.success) {
-      setAgentStatus('ok', '🟢 就绪');
+      setAgentStatus('ok', '就绪');
 
       // 如果流式输出已产生可见文本，不再重复显示
       // 若流式未能产生文本（API 未返回 text_delta），回退到直接显示
@@ -618,15 +971,15 @@ async function handleSend() {
 
       refreshFileList();
     } else {
-      setAgentStatus('warn', '⚠️ 错误');
+      setAgentStatus('warn', '错误');
       finalizeStream();
-      addMessage('assistant', `❌ 错误: ${result.error}`);
+      addMessage('assistant', `错误: ${result.error}`);
     }
   } catch (err) {
     if (progressCleanup) { progressCleanup(); progressCleanup = null; }
-    setAgentStatus('warn', '⚠️ 连接失败');
+    setAgentStatus('warn', '连接失败');
     finalizeStream();
-    addMessage('assistant', `❌ 通信异常: ${err.message}`);
+    addMessage('assistant', `通信异常: ${err.message}`);
   } finally {
     isProcessing = false;
     $btnSend.disabled = false;
@@ -682,7 +1035,7 @@ async function searchCommand(query) {
     return;
   }
 
-  addMessage('tool-summary', `🔍 搜索: ${query}`, '搜索');
+  addMessage('tool-summary', `搜索: ${query}`, '搜索');
   try {
     const result = await window.api.search.web(query);
     if (result.success) {
@@ -719,6 +1072,6 @@ function setAgentStatus(status, text) {
 // ============================================================
 
 ensureTopic().then(() => {
-  setAgentStatus('ok', '🟢 就绪');
+  setAgentStatus('ok', '就绪');
 });
 

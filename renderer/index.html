@@ -4,47 +4,60 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <meta http-equiv="Content-Security-Policy"
-        content="default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'" />
+        content="default-src 'self'; img-src 'self' data:; frame-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; script-src 'self'" />
   <title>个人通用助手</title>
   <link rel="stylesheet" href="style.css" />
 </head>
 <body>
   <div id="app">
-    <!-- 侧边栏 -->
     <aside id="sidebar">
       <div class="sidebar-header">
-        <h2>Topic</h2>
-        <button id="btn-new-topic" title="新建 Topic">＋</button>
+        <div class="app-brand">
+          <span class="brand-mark">GA</span>
+          <div>
+            <h2>个人通用助手</h2>
+            <small>Local workspace</small>
+          </div>
+        </div>
+        <button id="btn-new-topic" type="button" title="新建 Topic" aria-label="新建 Topic">+</button>
       </div>
       <ul id="topic-list"></ul>
-      <div class="sidebar-footer">
-        <small id="current-topic-label">—</small>
-      </div>
     </aside>
 
-    <!-- 主区域 -->
     <main id="main">
-      <!-- 消息区 -->
+      <header id="main-header">
+        <div class="topic-heading">
+          <span>Current Topic</span>
+          <strong id="current-topic-label">-</strong>
+        </div>
+        <div id="status-bar">
+          <span id="status-agent">Agent 未连接</span>
+        </div>
+      </header>
+
       <section id="messages"></section>
 
-      <!-- 输入区 -->
       <section id="input-area">
-        <textarea id="user-input" rows="2" placeholder="输入你的请求..."></textarea>
-        <button id="btn-upload" title="上传文件（Word/PDF/Excel/文本等）">📎</button>
-        <button id="btn-send">发送</button>
+        <button id="btn-upload" type="button" title="上传文件" aria-label="上传文件">+</button>
+        <textarea id="user-input" rows="2" placeholder="Ask, search, transform files, or generate artifacts..."></textarea>
+        <button id="btn-send" type="button">发送</button>
       </section>
     </main>
 
-    <!-- 右侧面板 — 文件列表 -->
     <aside id="right-panel">
       <div class="panel-header">
-        <h3>文件</h3>
-        <button id="btn-refresh-files" title="刷新">↻</button>
+        <div>
+          <h3>Artifacts</h3>
+          <small>Topic workspace</small>
+        </div>
+        <button id="btn-refresh-files" type="button" title="刷新" aria-label="刷新">↻</button>
       </div>
-      <ul id="file-list"></ul>
-      <div id="status-bar">
-        <span id="status-agent">⚪ Agent 未连接</span>
-      </div>
+      <section id="artifact-browser">
+        <ul id="file-list"></ul>
+      </section>
+      <section id="artifact-preview" class="artifact-preview empty">
+        <div class="preview-empty">选择文件预览</div>
+      </section>
     </aside>
   </div>
 

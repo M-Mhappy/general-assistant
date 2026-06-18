@@ -128,6 +128,28 @@ function updateTopicMeta(topicId, patch) {
 }
 
 /**
+ * 删除指定 Topic workspace。
+ * 只允许删除 TOPICS_ROOT 下已存在的 topic_<id> 目录。
+ */
+function deleteTopic(topicId) {
+  ensureWorkspaceRoot();
+
+  const topic = listAllTopics().find((t) => t.id === topicId);
+  if (!topic) {
+    throw new Error(`Topic "${topicId}" 不存在`);
+  }
+
+  const root = path.resolve(TOPICS_ROOT);
+  const target = path.resolve(topic.dirPath);
+  if (!target.startsWith(root + path.sep)) {
+    throw new Error(`拒绝删除越权路径: ${topicId}`);
+  }
+
+  fs.rmSync(target, { recursive: true, force: true });
+  return true;
+}
+
+/**
  * 获取 Topic workspace 根路径。
  */
 function getTopicPath(topicId) {
@@ -150,6 +172,7 @@ module.exports = {
   listAllTopics,
   readTopicMeta,
   updateTopicMeta,
+  deleteTopic,
   getTopicPath,
   getTopicSubPath,
   TOPICS_ROOT,
